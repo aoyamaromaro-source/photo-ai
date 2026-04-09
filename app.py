@@ -58,7 +58,7 @@ def calc_light_score(img):
 
 # ===== CLIP =====
 model, _, preprocess = open_clip.create_model_and_transforms(
-    'ViT-L-14', pretrained='openai'
+    'ViT-B-32', pretrained='openai'
 )
 model.eval()
 
