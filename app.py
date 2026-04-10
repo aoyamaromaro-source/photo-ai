@@ -134,27 +134,36 @@ if uploaded_files:
     results = {cat: [] for cat in categories}
 
     # ===== 推論 =====
-    for file, img, date in image_data:
+    @st.cache_data
+    def run_inference(image_data):
+        results = {cat: [] for cat in ["dog", "person", "landscape", "food"]}
 
-        image = preprocess(img).unsqueeze(0)
+        for file, img, date in image_data:
 
-        with torch.no_grad():
-            image_features = model.encode_image(image)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
+            image = preprocess(img).unsqueeze(0)
 
-        scores = {}
-        for cat, text_feat in text_features_dict.items():
-            scores[cat] = (image_features @ text_feat.unsqueeze(1)).item()
+            with torch.no_grad():
+                image_features = model.encode_image(image)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
 
-        category = max(scores, key=scores.get)
-        subject = scores[category]
+            scores = {}
+            for cat, text_feat in text_features_dict.items():
+                scores[cat] = (image_features @ text_feat.unsqueeze(1)).item()
 
-        light = calc_light_score(img)
-        composition = calc_composition_score(img)
+            category = max(scores, key=scores.get)
+            subject = scores[category]
 
-        total = light*0.3 + composition*0.3 + subject*0.4
+            light = calc_light_score(img)
+            composition = calc_composition_score(img)
 
-        results[category].append((file, total, light, composition, subject))
+            total = light*0.3 + composition*0.3 + subject*0.4
+
+            results[category].append((file, total, light, composition, subject))
+
+        return results
+    
+if st.button("ランキング実行"):
+        results = run_inference(image_data)
 
     # ===== 表示 =====
     for cat in categories:
@@ -170,7 +179,7 @@ if uploaded_files:
 
                 st.markdown(f"""
 🥇順位: {i+1}  
-スコア: {score:.2f}  
+スコア: {score:.2f} 
 光: {light:.2f}  
 構図: {comp:.2f}  
 被写体: {subj:.2f}
