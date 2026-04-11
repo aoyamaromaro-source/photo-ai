@@ -1,18 +1,24 @@
 import streamlit as st
-import os
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 import open_clip
-from datetime import datetime
-from PIL import ExifTags
 import numpy as np
 from pillow_heif import register_heif_opener
+import io
 
 register_heif_opener()
-
 st.set_page_config(layout="wide")
 
-# ===== 軽量CLIP（キャッシュ）=====
+# ===== セッション =====
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+# ===== UI =====
+st.title("📸 AIフォトコンテスト")
+
+selected_view = st.selectbox("表示モード", ["総合", "dog", "person", "landscape", "food"])
+
+# ===== モデル =====
 @st.cache_resource
 def load_model():
     model, _, preprocess = open_clip.create_model_and_transforms(
@@ -23,164 +29,184 @@ def load_model():
 
 model, preprocess = load_model()
 
-# ===== スコア =====
-def calc_composition_score(img):
-    gray = np.array(img.convert("L"))
-    h, w = gray.shape
-
-    center = gray[h//4:3*h//4, w//4:3*w//4]
-
-    outer_mean = np.mean([
-        gray[:h//4, :].mean(),
-        gray[3*h//4:, :].mean(),
-        gray[:, :w//4].mean(),
-        gray[:, 3*w//4:].mean()
-    ])
-
-    diff = abs(center.mean() - outer_mean)
-    return max(0, min(1 - diff / 255, 1))
-
-
-def calc_light_score(img):
-    gray = np.array(img.convert("L"))
-    brightness = gray.mean()
-    contrast = gray.std()
-
-    brightness_score = 1 - abs(brightness - 140) / 140
-    contrast_score = contrast / 100
-
-    return max(0, min((brightness_score*0.6 + contrast_score*0.4), 1))
-
-# ===== UI =====
-st.title("📸 AIフォトコンテスト")
-
-uploaded_files = st.file_uploader(
-    "写真を選択（複数OK）",
-    type=["jpg", "jpeg", "png", "heic"],
-    accept_multiple_files=True
-)
-
-# ===== フィルタ =====
-filter_type = st.selectbox(
-    "📅 フィルタ",
-    ["すべて", "直近50枚", "直近100枚", "今月"]
-)
-
 # ===== カテゴリ =====
-categories = ["dog", "person", "landscape", "food"]
-
 texts = {
-    "dog": ["a dog", "a cute dog", "a pet dog"],
-    "person": ["a person", "a human face", "a portrait"],
-    "landscape": ["landscape", "nature scenery", "mountain"],
-    "food": ["food", "meal", "dish"]
+    "dog":["a dog","cute dog","pet dog"],
+    "person":[
+        "a person",
+        "a human face",
+        "portrait photo",
+        "upper body of a person",
+        "a person standing",
+        "people"
+    ],
+    "landscape":["landscape","nature","mountain"],
+    "food":["food","meal","dish"]
 }
 
-# ===== テキスト特徴量 =====
+# ===== テキスト特徴（そのまま保持）=====
 text_features_dict = {}
 for cat, txts in texts.items():
     tokens = open_clip.tokenize(txts)
     with torch.no_grad():
-        features = model.encode_text(tokens)
-        features /= features.norm(dim=-1, keepdim=True)
-    text_features_dict[cat] = features.mean(dim=0)
+        f = model.encode_text(tokens)
+        f /= f.norm(dim=-1, keepdim=True)
+    text_features_dict[cat] = f  # ←平均しない
 
-# ===== 日付取得 =====
-def get_date(img):
-    try:
-        if hasattr(img, "_getexif") and img._getexif():
-            exif = img._getexif()
-            for tag, value in exif.items():
-                if ExifTags.TAGS.get(tag, tag) == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-    except:
-        pass
-    return datetime.now()
+# ===== 品質スコア =====
+quality_texts = [
+    "high quality photo",
+    "well composed photo",
+    "blurry photo",
+    "dark photo"
+]
 
-# ===== メイン処理 =====
+tokens = open_clip.tokenize(quality_texts)
+with torch.no_grad():
+    qf = model.encode_text(tokens)
+    qf /= qf.norm(dim=-1, keepdim=True)
+quality_feature = qf
+
+# ===== maxスコア関数（重要）=====
+def get_best_score(feat, text_features):
+    sims = (feat @ text_features.T).squeeze()
+    return sims.max().item()
+
+# ===== 推論 =====
+def run_inference(image_data):
+
+    results = []
+
+    for file, img in image_data:
+
+        image = preprocess(img).unsqueeze(0)
+
+        with torch.no_grad():
+            feat = model.encode_image(image)
+            feat /= feat.norm(dim=-1, keepdim=True)
+
+        # ===== カテゴリスコア（max）=====
+        scores = {}
+        for cat, text_feat in text_features_dict.items():
+            scores[cat] = get_best_score(feat, text_feat)
+
+        best_cat = max(scores, key=scores.get)
+
+        # ===== 明るさ・コントラスト =====
+        gray = np.array(img.convert("L"))
+        brightness = gray.mean()
+        contrast = gray.std()
+
+        # ===== 品質スコア =====
+        quality_score = get_best_score(feat, quality_feature)
+
+        # ===== 内訳スコア（100点化）=====
+        cat_score = scores[best_cat] * 100
+        quality_score_100 = quality_score * 100
+        bright_score = max(0, 100 - abs(brightness-120))
+        contrast_score = min(100, contrast * 2)
+
+        total = (
+            cat_score*0.4 +
+            quality_score_100*0.3 +
+            bright_score*0.2 +
+            contrast_score*0.1
+        )
+
+        results.append({
+            "file": file,
+            "total": total,
+            "cat": best_cat,
+            "scores": scores,
+            "detail": {
+                "カテゴリ一致": round(cat_score,1),
+                "品質": round(quality_score_100,1),
+                "明るさ": round(bright_score,1),
+                "コントラスト": round(contrast_score,1)
+            }
+        })
+
+    return results
+
+# ===== アップロード =====
+uploaded_files = st.file_uploader("写真を選択", accept_multiple_files=True)
+
 if uploaded_files:
 
-    if len(uploaded_files) > 100:
-        st.warning("最大100枚までにしてください")
-        st.stop()
-
     image_data = []
-
-    for file in uploaded_files:
+    for f in uploaded_files:
         try:
-            img = Image.open(file).convert("RGB")
-
-            # 軽量化
-            img = img.resize((512, 512))
-
-            date = get_date(img)
-
-            image_data.append((file, img, date))
+            img = Image.open(f).convert("RGB").resize((512,512))
+            image_data.append((f,img))
         except:
             continue
 
-    # ===== ソート =====
-    image_data.sort(key=lambda x: x[2], reverse=True)
+    if st.button("ランキング実行"):
+        with st.spinner("分析中..."):
+            st.session_state.results = run_inference(image_data)
 
-    # ===== フィルタ =====
-    if filter_type == "直近50枚":
-        image_data = image_data[:50]
-    elif filter_type == "直近100枚":
-        image_data = image_data[:100]
-    elif filter_type == "今月":
-        now = datetime.now()
-        image_data = [x for x in image_data if x[2].month == now.month]
+# ===== 表示 =====
+if st.session_state.results:
 
-    results = {cat: [] for cat in categories}
+    results = st.session_state.results
 
-    # ===== 推論 =====
-    @st.cache_data
-    def run_inference(image_data):
-        results = {cat: [] for cat in ["dog", "person", "landscape", "food"]}
+    # ===== 人物専用ロジック =====
+    if selected_view == "person":
+        results = [
+            r for r in results
+            if r["scores"]["person"] > 0.18
+        ]
+        results = sorted(results, key=lambda r: r["scores"]["person"], reverse=True)
 
-        for file, img, date in image_data:
+    elif selected_view != "総合":
+        results = [
+            r for r in results
+            if r["cat"] == selected_view
+            and r["scores"][selected_view] > 0.2
+        ]
+        results = sorted(results, key=lambda r: r["total"], reverse=True)
 
-            image = preprocess(img).unsqueeze(0)
+    else:
+        results = sorted(results, key=lambda r: r["total"], reverse=True)
 
-            with torch.no_grad():
-                image_features = model.encode_image(image)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
+    st.subheader("TOP4")
 
-            scores = {}
-            for cat, text_feat in text_features_dict.items():
-                scores[cat] = (image_features @ text_feat.unsqueeze(1)).item()
+    for r in results[:4]:
 
-            category = max(scores, key=scores.get)
-            subject = scores[category]
+        col1, col2 = st.columns([1,1])
 
-            light = calc_light_score(img)
-            composition = calc_composition_score(img)
+        with col1:
+            st.image(r["file"], width=250)
 
-            total = light*0.3 + composition*0.3 + subject*0.4
+        with col2:
+            st.write(f"総合スコア：{round(r['total'],1)}点")
+            st.write(f"カテゴリ：{r['cat']}")
 
-            results[category].append((file, total, light, composition, subject))
+            st.write("内訳：")
+            for k,v in r["detail"].items():
+                st.write(f"{k}：{v}点")
 
-        return results
-    
-if st.button("ランキング実行"):
-        results = run_inference(image_data)
+            st.write("カテゴリ詳細スコア：")
+            for k,v in r["scores"].items():
+                st.write(f"{k}：{round(v,2)}")
 
-    # ===== 表示 =====
-    for cat in categories:
-        st.subheader(f"🏆 {cat}")
+    # ===== インスタ画像 =====
+    if st.button("インスタ画像生成"):
 
-        results[cat].sort(key=lambda x: x[1], reverse=True)
+        W,H = 1080,1080
+        canvas = Image.new("RGB",(W,H),(15,15,15))
+        draw = ImageDraw.Draw(canvas)
 
-        cols = st.columns(3)
+        positions = [(0,0),(540,0),(0,540),(540,540)]
 
-        for i, (file, score, light, comp, subj) in enumerate(results[cat][:3]):
-            with cols[i]:
-                st.image(file)
+        for i,r in enumerate(results[:4]):
+            img = Image.open(r["file"]).resize((540,540))
+            canvas.paste(img,positions[i])
+            draw.text((positions[i][0]+20,positions[i][1]+20),
+                      f"#{i+1}",fill=(255,255,255))
 
-                st.markdown(f"""
-🥇順位: {i+1}  
-スコア: {score:.2f} 
-光: {light:.2f}  
-構図: {comp:.2f}  
-被写体: {subj:.2f}
-""")
+        st.image(canvas)
+
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG")
+        st.download_button("DL",buf.getvalue(),"insta.jpg","image/jpeg")
