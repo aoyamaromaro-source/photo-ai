@@ -31,32 +31,50 @@ model, preprocess = load_model()
 
 # ===== カテゴリ =====
 texts = {
-    "dog":["a dog","cute dog","pet dog"],
+    "dog":[
+        "a dog",
+        "cute dog",
+        "pet dog"
+    ],
     "person":[
         "a person",
-        "a human face",
-        "portrait photo",
-        "upper body of a person",
-        "a person standing",
-        "people"
+        "people",
+        "group of people",
+        "family photo",
+        "friends photo",
+        "portrait",
+        "close up face"
     ],
-    "landscape":["landscape","nature","mountain"],
-    "food":["food","meal","dish"]
+    "landscape":[
+        "landscape",
+        "nature scenery",
+        "mountain",
+        "outdoor view"
+    ],
+    "food":[
+        "food",
+        "delicious food",
+        "meal",
+        "dish",
+        "restaurant food",
+        "plated food"
+    ]
 }
 
-# ===== テキスト特徴（そのまま保持）=====
+# ===== テキスト特徴 =====
 text_features_dict = {}
 for cat, txts in texts.items():
     tokens = open_clip.tokenize(txts)
     with torch.no_grad():
         f = model.encode_text(tokens)
         f /= f.norm(dim=-1, keepdim=True)
-    text_features_dict[cat] = f  # ←平均しない
+    text_features_dict[cat] = f
 
 # ===== 品質スコア =====
 quality_texts = [
     "high quality photo",
     "well composed photo",
+    "sharp photo",
     "blurry photo",
     "dark photo"
 ]
@@ -67,7 +85,7 @@ with torch.no_grad():
     qf /= qf.norm(dim=-1, keepdim=True)
 quality_feature = qf
 
-# ===== maxスコア関数（重要）=====
+# ===== maxスコア =====
 def get_best_score(feat, text_features):
     sims = (feat @ text_features.T).squeeze()
     return sims.max().item()
@@ -85,22 +103,18 @@ def run_inference(image_data):
             feat = model.encode_image(image)
             feat /= feat.norm(dim=-1, keepdim=True)
 
-        # ===== カテゴリスコア（max）=====
         scores = {}
         for cat, text_feat in text_features_dict.items():
             scores[cat] = get_best_score(feat, text_feat)
 
         best_cat = max(scores, key=scores.get)
 
-        # ===== 明るさ・コントラスト =====
         gray = np.array(img.convert("L"))
         brightness = gray.mean()
         contrast = gray.std()
 
-        # ===== 品質スコア =====
         quality_score = get_best_score(feat, quality_feature)
 
-        # ===== 内訳スコア（100点化）=====
         cat_score = scores[best_cat] * 100
         quality_score_100 = quality_score * 100
         bright_score = max(0, 100 - abs(brightness-120))
@@ -150,20 +164,40 @@ if st.session_state.results:
 
     results = st.session_state.results
 
-    # ===== 人物専用ロジック =====
     if selected_view == "person":
-        results = [
-            r for r in results
-            if r["scores"]["person"] > 0.18
-        ]
-        results = sorted(results, key=lambda r: r["scores"]["person"], reverse=True)
+
+        filtered = []
+
+        for r in results:
+
+            p = r["scores"]["person"]
+            others = max(
+                r["scores"]["dog"],
+                r["scores"]["landscape"],
+                r["scores"]["food"]
+            )
+
+            # 強い → 無条件OK
+            if p > 0.26:
+                filtered.append(r)
+
+            # 中間 → ゆるく通す（集合写真救済）
+            elif p > 0.18 and (p - others) > -0.01:
+                filtered.append(r)
+
+            # 弱い → 厳しく（レモン排除）
+            elif p > 0.15 and (p - others) > 0.03:
+                filtered.append(r)
+
+        results = sorted(filtered, key=lambda r: r["scores"]["person"], reverse=True)
 
     elif selected_view != "総合":
+
         results = [
             r for r in results
-            if r["cat"] == selected_view
-            and r["scores"][selected_view] > 0.2
+            if r["cat"] == selected_view and r["scores"][selected_view] > 0.18
         ]
+
         results = sorted(results, key=lambda r: r["total"], reverse=True)
 
     else:
@@ -179,16 +213,26 @@ if st.session_state.results:
             st.image(r["file"], width=250)
 
         with col2:
-            st.write(f"総合スコア：{round(r['total'],1)}点")
-            st.write(f"カテゴリ：{r['cat']}")
+            st.markdown(f"""
+### 総合スコア：{round(r['total'],1)}点  
+カテゴリ：{r['cat']}
 
-            st.write("内訳：")
-            for k,v in r["detail"].items():
-                st.write(f"{k}：{v}点")
+---
 
-            st.write("カテゴリ詳細スコア：")
-            for k,v in r["scores"].items():
-                st.write(f"{k}：{round(v,2)}")
+**内訳**
+- カテゴリ一致：{r["detail"]["カテゴリ一致"]}点  
+- 品質：{r["detail"]["品質"]}点  
+- 明るさ：{r["detail"]["明るさ"]}点  
+- コントラスト：{r["detail"]["コントラスト"]}点  
+
+---
+
+**カテゴリ詳細スコア**
+- dog：{round(r["scores"]["dog"],2)}  
+- person：{round(r["scores"]["person"],2)}  
+- landscape：{round(r["scores"]["landscape"],2)}  
+- food：{round(r["scores"]["food"],2)}  
+""")
 
     # ===== インスタ画像 =====
     if st.button("インスタ画像生成"):
