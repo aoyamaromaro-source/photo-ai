@@ -1,5 +1,5 @@
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 import torch
 import open_clip
 import numpy as np
@@ -15,7 +15,6 @@ if "results" not in st.session_state:
 
 # ===== UI =====
 st.title("📸 AIフォトコンテスト")
-
 selected_view = st.selectbox("表示モード", ["総合", "dog", "person", "landscape", "food"])
 
 # ===== モデル =====
@@ -31,34 +30,10 @@ model, preprocess = load_model()
 
 # ===== カテゴリ =====
 texts = {
-    "dog":[
-        "a dog",
-        "cute dog",
-        "pet dog"
-    ],
-    "person":[
-        "a person",
-        "people",
-        "group of people",
-        "family photo",
-        "friends photo",
-        "portrait",
-        "close up face"
-    ],
-    "landscape":[
-        "landscape",
-        "nature scenery",
-        "mountain",
-        "outdoor view"
-    ],
-    "food":[
-        "food",
-        "delicious food",
-        "meal",
-        "dish",
-        "restaurant food",
-        "plated food"
-    ]
+    "dog":["a dog","cute dog","pet dog"],
+    "person":["a person","people","group of people","family photo","friends photo","portrait","close up face"],
+    "landscape":["landscape","nature scenery","mountain","outdoor view"],
+    "food":["food","delicious food","meal","dish","restaurant food","plated food"]
 }
 
 # ===== テキスト特徴 =====
@@ -71,13 +46,7 @@ for cat, txts in texts.items():
     text_features_dict[cat] = f
 
 # ===== 品質スコア =====
-quality_texts = [
-    "high quality photo",
-    "well composed photo",
-    "sharp photo",
-    "blurry photo",
-    "dark photo"
-]
+quality_texts = ["high quality photo","well composed photo","sharp photo","blurry photo","dark photo"]
 
 tokens = open_clip.tokenize(quality_texts)
 with torch.no_grad():
@@ -89,6 +58,48 @@ quality_feature = qf
 def get_best_score(feat, text_features):
     sims = (feat @ text_features.T).squeeze()
     return sims.max().item()
+
+# ===== 相対評価 =====
+def assign_ranks(results):
+
+    def rank_list(values):
+        sorted_vals = sorted(values, reverse=True)
+        ranks = {}
+
+        for v in values:
+            idx = sorted_vals.index(v)
+            ratio = idx / len(values)
+
+            if ratio < 0.25:
+                ranks[v] = "A"
+            elif ratio < 0.5:
+                ranks[v] = "B"
+            elif ratio < 0.75:
+                ranks[v] = "C"
+            else:
+                ranks[v] = "D"
+
+        return ranks
+
+    cat_vals = [r["detail"]["カテゴリ一致"] for r in results]
+    qual_vals = [r["detail"]["品質"] for r in results]
+    bright_vals = [r["detail"]["明るさ"] for r in results]
+    cont_vals = [r["detail"]["コントラスト"] for r in results]
+
+    cat_rank = rank_list(cat_vals)
+    qual_rank = rank_list(qual_vals)
+    bright_rank = rank_list(bright_vals)
+    cont_rank = rank_list(cont_vals)
+
+    for r in results:
+        r["rank_detail"] = {
+            "カテゴリ一致": cat_rank[r["detail"]["カテゴリ一致"]],
+            "品質": qual_rank[r["detail"]["品質"]],
+            "明るさ": bright_rank[r["detail"]["明るさ"]],
+            "コントラスト": cont_rank[r["detail"]["コントラスト"]]
+        }
+
+    return results
 
 # ===== 推論 =====
 def run_inference(image_data):
@@ -148,16 +159,23 @@ uploaded_files = st.file_uploader("写真を選択", accept_multiple_files=True)
 if uploaded_files:
 
     image_data = []
-    for f in uploaded_files:
+    progress = st.progress(0)
+
+    for i, f in enumerate(uploaded_files):
         try:
-            img = Image.open(f).convert("RGB").resize((512,512))
+            img = Image.open(f)
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB").resize((256,256))
             image_data.append((f,img))
         except:
             continue
 
+        progress.progress((i+1)/len(uploaded_files))
+
     if st.button("ランキング実行"):
-        with st.spinner("分析中..."):
-            st.session_state.results = run_inference(image_data)
+        with st.spinner("📸 AIが写真を分析中です..."):
+            results = run_inference(image_data)
+            st.session_state.results = assign_ranks(results)
 
 # ===== 表示 =====
 if st.session_state.results:
@@ -169,35 +187,20 @@ if st.session_state.results:
         filtered = []
 
         for r in results:
-
             p = r["scores"]["person"]
-            others = max(
-                r["scores"]["dog"],
-                r["scores"]["landscape"],
-                r["scores"]["food"]
-            )
+            others = max(r["scores"]["dog"], r["scores"]["landscape"], r["scores"]["food"])
 
-            # 強い → 無条件OK
             if p > 0.26:
                 filtered.append(r)
-
-            # 中間 → ゆるく通す（集合写真救済）
             elif p > 0.18 and (p - others) > -0.01:
                 filtered.append(r)
-
-            # 弱い → 厳しく（レモン排除）
             elif p > 0.15 and (p - others) > 0.03:
                 filtered.append(r)
 
         results = sorted(filtered, key=lambda r: r["scores"]["person"], reverse=True)
 
     elif selected_view != "総合":
-
-        results = [
-            r for r in results
-            if r["cat"] == selected_view and r["scores"][selected_view] > 0.18
-        ]
-
+        results = [r for r in results if r["cat"] == selected_view and r["scores"][selected_view] > 0.18]
         results = sorted(results, key=lambda r: r["total"], reverse=True)
 
     else:
@@ -219,19 +222,11 @@ if st.session_state.results:
 
 ---
 
-**内訳**
-- カテゴリ一致：{r["detail"]["カテゴリ一致"]}点  
-- 品質：{r["detail"]["品質"]}点  
-- 明るさ：{r["detail"]["明るさ"]}点  
-- コントラスト：{r["detail"]["コントラスト"]}点  
-
----
-
-**カテゴリ詳細スコア**
-- dog：{round(r["scores"]["dog"],2)}  
-- person：{round(r["scores"]["person"],2)}  
-- landscape：{round(r["scores"]["landscape"],2)}  
-- food：{round(r["scores"]["food"],2)}  
+**内訳（相対評価）**
+- カテゴリ一致：{r["rank_detail"]["カテゴリ一致"]}  
+- 品質：{r["rank_detail"]["品質"]}  
+- 明るさ：{r["rank_detail"]["明るさ"]}  
+- コントラスト：{r["rank_detail"]["コントラスト"]}  
 """)
 
     # ===== インスタ画像 =====
@@ -244,7 +239,9 @@ if st.session_state.results:
         positions = [(0,0),(540,0),(0,540),(540,540)]
 
         for i,r in enumerate(results[:4]):
-            img = Image.open(r["file"]).resize((540,540))
+            img = Image.open(r["file"])
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB").resize((540,540))
             canvas.paste(img,positions[i])
             draw.text((positions[i][0]+20,positions[i][1]+20),
                       f"#{i+1}",fill=(255,255,255))
