@@ -100,7 +100,7 @@ def assign_ranks(results):
 
     return results
 
-# ===== 推論（逐次処理） =====
+# ===== 推論（逐次処理＋軽量化） =====
 def run_inference_stream(uploaded_files):
 
     results = []
@@ -146,7 +146,7 @@ def run_inference_stream(uploaded_files):
         )
 
         results.append({
-            "file_bytes": f.getvalue(),  # 軽量保存
+            "file": f,  # ← 軽量参照に戻す
             "total": total,
             "cat": best_cat,
             "scores": scores,
@@ -160,9 +160,11 @@ def run_inference_stream(uploaded_files):
 
         # メモリ解放
         del img, image, feat
-        torch.cuda.empty_cache()
 
         progress.progress((i+1)/len(uploaded_files))
+
+    # 👉 上位だけ残す（メモリ対策）
+    results = sorted(results, key=lambda r: r["total"], reverse=True)[:30]
 
     return results
 
@@ -212,7 +214,7 @@ if st.session_state.results:
         col1, col2 = st.columns([1,1])
 
         with col1:
-            st.image(r["file_bytes"], width=250)
+            st.image(r["file"], width=250)
 
         with col2:
             st.markdown(f"""
@@ -238,8 +240,9 @@ if st.session_state.results:
         positions = [(0,0),(540,0),(0,540),(540,540)]
 
         for i,r in enumerate(results[:4]):
-            img = Image.open(io.BytesIO(r["file_bytes"]))
-            img = img.resize((540,540))
+            img = Image.open(r["file"])
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB").resize((540,540))
             canvas.paste(img,positions[i])
             draw.text((positions[i][0]+20,positions[i][1]+20),
                       f"#{i+1}",fill=(255,255,255))
