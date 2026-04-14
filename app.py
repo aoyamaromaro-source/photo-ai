@@ -17,42 +17,41 @@ if "results" not in st.session_state:
 st.title("📸 AIフォトコンテスト")
 selected_view = st.selectbox("表示モード", ["総合", "dog", "person", "landscape", "food"])
 
-# ===== モデル =====
+# ===== モデル＋特徴まとめてキャッシュ =====
 @st.cache_resource
-def load_model():
+def load_all():
+
     model, _, preprocess = open_clip.create_model_and_transforms(
         'ViT-B-32', pretrained='openai'
     )
     model.eval()
-    return model, preprocess
+    model.to("cpu")
 
-model, preprocess = load_model()
+    texts = {
+        "dog":["a dog","cute dog","pet dog"],
+        "person":["a person","people","group of people","family photo","friends photo","portrait","close up face"],
+        "landscape":["landscape","nature scenery","mountain","outdoor view"],
+        "food":["food","delicious food","meal","dish","restaurant food","plated food"]
+    }
 
-# ===== カテゴリ =====
-texts = {
-    "dog":["a dog","cute dog","pet dog"],
-    "person":["a person","people","group of people","family photo","friends photo","portrait","close up face"],
-    "landscape":["landscape","nature scenery","mountain","outdoor view"],
-    "food":["food","delicious food","meal","dish","restaurant food","plated food"]
-}
+    text_features_dict = {}
+    for cat, txts in texts.items():
+        tokens = open_clip.tokenize(txts)
+        with torch.no_grad():
+            f = model.encode_text(tokens)
+            f /= f.norm(dim=-1, keepdim=True)
+        text_features_dict[cat] = f
 
-# ===== テキスト特徴 =====
-text_features_dict = {}
-for cat, txts in texts.items():
-    tokens = open_clip.tokenize(txts)
+    quality_texts = ["high quality photo","well composed photo","sharp photo","blurry photo","dark photo"]
+
+    tokens = open_clip.tokenize(quality_texts)
     with torch.no_grad():
-        f = model.encode_text(tokens)
-        f /= f.norm(dim=-1, keepdim=True)
-    text_features_dict[cat] = f
+        qf = model.encode_text(tokens)
+        qf /= qf.norm(dim=-1, keepdim=True)
 
-# ===== 品質スコア =====
-quality_texts = ["high quality photo","well composed photo","sharp photo","blurry photo","dark photo"]
+    return model, preprocess, text_features_dict, qf
 
-tokens = open_clip.tokenize(quality_texts)
-with torch.no_grad():
-    qf = model.encode_text(tokens)
-    qf /= qf.norm(dim=-1, keepdim=True)
-quality_feature = qf
+model, preprocess, text_features_dict, quality_feature = load_all()
 
 # ===== maxスコア =====
 def get_best_score(feat, text_features):
@@ -165,7 +164,7 @@ if uploaded_files:
         try:
             img = Image.open(f)
             img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB").resize((256,256))
+            img = img.convert("RGB").resize((224,224))
             image_data.append((f,img))
         except:
             continue
