@@ -17,7 +17,7 @@ if "results" not in st.session_state:
 st.title("📸 AIフォトコンテスト")
 selected_view = st.selectbox("表示モード", ["総合", "dog", "person", "landscape", "food"])
 
-# ===== モデル＋特徴まとめてキャッシュ =====
+# ===== モデル＋特徴キャッシュ =====
 @st.cache_resource
 def load_all():
 
@@ -100,12 +100,20 @@ def assign_ranks(results):
 
     return results
 
-# ===== 推論 =====
-def run_inference(image_data):
+# ===== 推論（逐次処理） =====
+def run_inference_stream(uploaded_files):
 
     results = []
+    progress = st.progress(0)
 
-    for file, img in image_data:
+    for i, f in enumerate(uploaded_files):
+
+        try:
+            img = Image.open(f)
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB").resize((224,224))
+        except:
+            continue
 
         image = preprocess(img).unsqueeze(0)
 
@@ -138,7 +146,7 @@ def run_inference(image_data):
         )
 
         results.append({
-            "file": file,
+            "file_bytes": f.getvalue(),  # 軽量保存
             "total": total,
             "cat": best_cat,
             "scores": scores,
@@ -150,6 +158,12 @@ def run_inference(image_data):
             }
         })
 
+        # メモリ解放
+        del img, image, feat
+        torch.cuda.empty_cache()
+
+        progress.progress((i+1)/len(uploaded_files))
+
     return results
 
 # ===== アップロード =====
@@ -157,23 +171,9 @@ uploaded_files = st.file_uploader("写真を選択", accept_multiple_files=True)
 
 if uploaded_files:
 
-    image_data = []
-    progress = st.progress(0)
-
-    for i, f in enumerate(uploaded_files):
-        try:
-            img = Image.open(f)
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB").resize((224,224))
-            image_data.append((f,img))
-        except:
-            continue
-
-        progress.progress((i+1)/len(uploaded_files))
-
     if st.button("ランキング実行"):
         with st.spinner("📸 AIが写真を分析中です..."):
-            results = run_inference(image_data)
+            results = run_inference_stream(uploaded_files)
             st.session_state.results = assign_ranks(results)
 
 # ===== 表示 =====
@@ -212,7 +212,7 @@ if st.session_state.results:
         col1, col2 = st.columns([1,1])
 
         with col1:
-            st.image(r["file"], width=250)
+            st.image(r["file_bytes"], width=250)
 
         with col2:
             st.markdown(f"""
@@ -238,9 +238,8 @@ if st.session_state.results:
         positions = [(0,0),(540,0),(0,540),(540,540)]
 
         for i,r in enumerate(results[:4]):
-            img = Image.open(r["file"])
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB").resize((540,540))
+            img = Image.open(io.BytesIO(r["file_bytes"]))
+            img = img.resize((540,540))
             canvas.paste(img,positions[i])
             draw.text((positions[i][0]+20,positions[i][1]+20),
                       f"#{i+1}",fill=(255,255,255))
