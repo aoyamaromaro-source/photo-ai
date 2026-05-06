@@ -2,188 +2,237 @@
 
 import streamlit as st
 from PIL import Image, ImageDraw
+import torch
+import open_clip
 import numpy as np
-import pandas as pd
+from pillow_heif import register_heif_opener
 import io
 
-st.set_page_config(page_title="写真ランキングAI", layout="wide")
+register_heif_opener()
+st.set_page_config(layout="wide")
 
-st.title("📷 写真ランキングAI（完成版）")
-st.caption("軽量だけどちゃんとジャンル分け＋ランキング＋SNS画像生成")
+st.title("📸 AIフォトコンテスト（CLIP版完成形）")
 
-# -------------------------
-# スコア計算
-# -------------------------
-def calc_score(img):
-    arr = np.array(img)
-
-    brightness = arr.mean()
-    contrast = arr.std()
-    colorfulness = (
-        np.std(arr[:,:,0]) +
-        np.std(arr[:,:,1]) +
-        np.std(arr[:,:,2])
+# =============================
+# モデルロード（キャッシュ）
+# =============================
+@st.cache_resource
+def load_model():
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        'ViT-B-32', pretrained='openai'
     )
+    model.eval()
+    return model, preprocess
 
-    randomness = np.random.uniform(0, 15)
+model, preprocess = load_model()
 
-    score = brightness * 0.2 + contrast * 0.3 + colorfulness * 0.3 + randomness
-    return round(score, 1)
+# =============================
+# カテゴリ定義
+# =============================
+texts = {
+    "dog":[
+        "a dog","cute dog","pet dog"
+    ],
+    "person":[
+        "a person","people","family","friends","portrait","face"
+    ],
+    "landscape":[
+        "landscape","nature","mountain","outdoor","sky","scenery"
+    ],
+    "food":[
+        "food","meal","dish","delicious food","restaurant food"
+    ]
+}
 
-# -------------------------
-# カテゴリ判定（画像ベース）
-# -------------------------
-def detect_category(img):
-    arr = np.array(img)
+# =============================
+# テキスト特徴（キャッシュ）
+# =============================
+@st.cache_resource
+def build_text_features():
+    text_features_dict = {}
+    for cat, txts in texts.items():
+        tokens = open_clip.tokenize(txts)
+        with torch.no_grad():
+            f = model.encode_text(tokens)
+            f /= f.norm(dim=-1, keepdim=True)
+        text_features_dict[cat] = f
+    return text_features_dict
 
-    r = arr[:,:,0].mean()
-    g = arr[:,:,1].mean()
-    b = arr[:,:,2].mean()
+text_features_dict = build_text_features()
 
-    color_var = arr.std()
+# =============================
+# 品質テキスト
+# =============================
+@st.cache_resource
+def build_quality():
+    quality_texts = [
+        "high quality photo",
+        "sharp photo",
+        "well composed photo",
+        "blurry photo",
+        "dark photo"
+    ]
+    tokens = open_clip.tokenize(quality_texts)
+    with torch.no_grad():
+        qf = model.encode_text(tokens)
+        qf /= qf.norm(dim=-1, keepdim=True)
+    return qf
 
-    # 風景（緑・青）
-    if g > r and g > b:
-        return "🌄 風景"
+quality_feature = build_quality()
 
-    # 食べ物（暖色）
-    if r > 120 and g > 80:
-        return "🍜 食べ物"
+# =============================
+# スコア関数
+# =============================
+def get_best_score(feat, text_features):
+    sims = (feat @ text_features.T).squeeze()
+    return sims.max().item()
 
-    # 人物（明るくてコントラスト低め）
-    if color_var < 50 and r > 100:
-        return "😊 人物"
-
-    # ペット（色が強い）
-    if color_var > 70:
-        return "🐶 ペット"
-
-    return "📷 その他"
-
-# -------------------------
-# SNS画像生成
-# -------------------------
-def create_sns_image(img, title):
-    base = img.copy().resize((600, 600))
-
-    canvas = Image.new("RGB", (600, 700), "white")
-    canvas.paste(base, (0, 0))
-
-    draw = ImageDraw.Draw(canvas)
-    draw.text((20, 620), title, fill="black")
-
-    return canvas
-
-# -------------------------
-# アップロード
-# -------------------------
-files = st.file_uploader(
-    "写真をアップロード",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
-)
-
-if files:
+# =============================
+# 推論（キャッシュ）
+# =============================
+@st.cache_data
+def run_inference(image_data):
 
     results = []
-    progress = st.progress(0)
 
-    for i, file in enumerate(files):
-        img = Image.open(file).convert("RGB")
-        img.thumbnail((800, 800))  # 軽量化
+    for file, img in image_data:
 
-        score = calc_score(img)
-        category = detect_category(img)
+        image = preprocess(img).unsqueeze(0)
 
-        results.append({
-            "name": file.name,
-            "img": img,
-            "score": score,
-            "category": category
-        })
+        with torch.no_grad():
+            feat = model.encode_image(image)
+            feat /= feat.norm(dim=-1, keepdim=True)
 
-        progress.progress((i + 1) / len(files))
+        scores = {}
+        for cat, text_feat in text_features_dict.items():
+            scores[cat] = get_best_score(feat, text_feat)
 
-    # -------------------------
-    # 総合ランキング
-    # -------------------------
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
+        best_cat = max(scores, key=scores.get)
 
-    st.header("🏆 総合ランキング")
+        gray = np.array(img.convert("L"))
+        brightness = gray.mean()
+        contrast = gray.std()
 
-    for rank, item in enumerate(results, 1):
-        col1, col2 = st.columns([1,2])
+        quality_score = get_best_score(feat, quality_feature)
 
-        with col1:
-            st.image(item["img"], use_container_width=True)
-
-        with col2:
-            st.subheader(f"{rank}位 {item['name']}")
-            st.metric("スコア", item["score"])
-            st.write(item["category"])
-
-        st.divider()
-
-    # -------------------------
-    # ジャンル別TOP3
-    # -------------------------
-    st.header("🎯 ジャンル別ランキング（TOP3）")
-
-    categories = ["🐶 ペット", "🍜 食べ物", "🌄 風景", "😊 人物", "📷 その他"]
-
-    for cat in categories:
-        cat_items = [x for x in results if x["category"] == cat]
-
-        if len(cat_items) == 0:
-            continue
-
-        st.subheader(cat)
-
-        top3 = sorted(cat_items, key=lambda x: x["score"], reverse=True)[:3]
-
-        cols = st.columns(len(top3))
-
-        for i, item in enumerate(top3):
-            with cols[i]:
-                st.image(item["img"], use_container_width=True)
-                st.write(f"{i+1}位")
-                st.write(f"スコア: {item['score']}")
-
-        # SNS画像（1位）
-        best = top3[0]
-        sns_img = create_sns_image(best["img"], f"{cat} BEST1")
-
-        buf = io.BytesIO()
-        sns_img.save(buf, format="PNG")
-
-        st.download_button(
-            f"{cat} SNS画像ダウンロード",
-            buf.getvalue(),
-            file_name=f"{cat}_best.png",
-            mime="image/png"
+        total = (
+            scores[best_cat]*100*0.5 +
+            quality_score*100*0.3 +
+            (100-abs(brightness-120))*0.1 +
+            min(100, contrast*2)*0.1
         )
 
-    # -------------------------
-    # CSVダウンロード
-    # -------------------------
-    df = pd.DataFrame([
-        {
-            "順位": i+1,
-            "名前": x["name"],
-            "スコア": x["score"],
-            "カテゴリ": x["category"]
-        }
-        for i, x in enumerate(results)
-    ])
+        results.append({
+            "file": file,
+            "img": img,
+            "total": total,
+            "cat": best_cat,
+            "scores": scores
+        })
 
-    csv = df.to_csv(index=False).encode("utf-8-sig")
+    return results
 
-    st.download_button(
-        "📥 CSVダウンロード",
-        csv,
-        file_name="ranking.csv",
-        mime="text/csv"
-    )
+# =============================
+# アップロード
+# =============================
+uploaded_files = st.file_uploader("写真を選択", accept_multiple_files=True)
 
-else:
-    st.info("写真をアップロードしてください")
+if uploaded_files:
+
+    image_data = []
+    for f in uploaded_files:
+        try:
+            img = Image.open(f).convert("RGB").resize((384,384))
+            image_data.append((f,img))
+        except:
+            continue
+
+    if st.button("ランキング実行"):
+        with st.spinner("AI分析中..."):
+            results = run_inference(image_data)
+
+        # =============================
+        # 総合ランキング
+        # =============================
+        results_sorted = sorted(results, key=lambda x: x["total"], reverse=True)
+
+        st.header("🏆 総合ランキング")
+
+        for i, r in enumerate(results_sorted[:5]):
+            col1, col2 = st.columns([1,1])
+
+            with col1:
+                st.image(r["img"], use_container_width=True)
+
+            with col2:
+                st.subheader(f"{i+1}位")
+                st.metric("スコア", round(r["total"],1))
+                st.write(f"カテゴリ：{r['cat']}")
+
+        # =============================
+        # ジャンル別TOP3
+        # =============================
+        st.header("🎯 ジャンル別ランキング")
+
+        categories = ["dog","person","landscape","food"]
+
+        for cat in categories:
+
+            st.subheader(cat)
+
+            filtered = [r for r in results if r["cat"] == cat]
+
+            if len(filtered) == 0:
+                st.write("該当なし")
+                continue
+
+            top3 = sorted(filtered, key=lambda r: r["total"], reverse=True)[:3]
+
+            cols = st.columns(len(top3))
+
+            for i, r in enumerate(top3):
+                with cols[i]:
+                    st.image(r["img"], use_container_width=True)
+                    st.write(f"{i+1}位")
+                    st.write(f"{round(r['total'],1)}点")
+
+            # =============================
+            # SNS画像（ジャンル1位）
+            # =============================
+            best = top3[0]
+
+            canvas = Image.new("RGB",(1080,1080),(20,20,20))
+            img_resized = best["img"].resize((1080,1080))
+            canvas.paste(img_resized,(0,0))
+
+            draw = ImageDraw.Draw(canvas)
+            draw.text((30,30), f"{cat} BEST1", fill=(255,255,255))
+
+            buf = io.BytesIO()
+            canvas.save(buf, format="JPEG")
+
+            st.download_button(
+                f"{cat} SNS画像DL",
+                buf.getvalue(),
+                file_name=f"{cat}_best.jpg",
+                mime="image/jpeg"
+            )
+
+        # =============================
+        # 総合SNS（TOP4）
+        # =============================
+        st.header("📱 総合SNS画像")
+
+        canvas = Image.new("RGB",(1080,1080),(10,10,10))
+        positions = [(0,0),(540,0),(0,540),(540,540)]
+
+        for i,r in enumerate(results_sorted[:4]):
+            img = r["img"].resize((540,540))
+            canvas.paste(img,positions[i])
+
+        st.image(canvas)
+
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG")
+
+        st.download_button("総合SNS画像DL", buf.getvalue(), "ranking.jpg", "image/jpeg")
