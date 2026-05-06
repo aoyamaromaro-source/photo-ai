@@ -1,63 +1,64 @@
 # app.py
 
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import numpy as np
 import pandas as pd
 import io
 
 st.set_page_config(page_title="写真ランキングAI", layout="wide")
 
-st.title("📷 写真ランキングAI（強化版）")
-st.caption("ジャンル別ランキング＋SNSシェア画像生成")
+st.title("📷 写真ランキングAI（完成版）")
+st.caption("軽量だけどちゃんとジャンル分け＋ランキング＋SNS画像生成")
 
 # -------------------------
-# スコア計算（改良版）
+# スコア計算
 # -------------------------
 def calc_score(img):
     arr = np.array(img)
 
     brightness = arr.mean()
     contrast = arr.std()
-    colorfulness = np.std(arr[:,:,0]) + np.std(arr[:,:,1]) + np.std(arr[:,:,2])
+    colorfulness = (
+        np.std(arr[:,:,0]) +
+        np.std(arr[:,:,1]) +
+        np.std(arr[:,:,2])
+    )
 
-    # 少しランダム要素追加（重要）
     randomness = np.random.uniform(0, 15)
 
     score = brightness * 0.2 + contrast * 0.3 + colorfulness * 0.3 + randomness
     return round(score, 1)
 
 # -------------------------
-# カテゴリ判定
+# カテゴリ判定（画像ベース）
 # -------------------------
-def detect_category(filename):
-    name = filename.lower()
+def detect_category(img):
+    arr = np.array(img)
 
-    if any(x in name for x in ["dog", "inu", "pet"]):
-        return "🐶 ペット"
-    elif any(x in name for x in ["food", "meal", "lunch"]):
-        return "🍜 食べ物"
-    elif any(x in name for x in ["sea", "mountain", "sky"]):
+    r = arr[:,:,0].mean()
+    g = arr[:,:,1].mean()
+    b = arr[:,:,2].mean()
+
+    color_var = arr.std()
+
+    # 風景（緑・青）
+    if g > r and g > b:
         return "🌄 風景"
-    elif any(x in name for x in ["face", "selfie", "person"]):
-        return "😊 人物"
-    else:
-        return "📷 その他"
 
-# -------------------------
-# コメント（ジャンル別）
-# -------------------------
-def make_comment(category, score):
-    if category == "🐶 ペット":
-        return "表情が最高！癒し力高めです。"
-    elif category == "🍜 食べ物":
-        return "シズル感があって美味しそう！"
-    elif category == "🌄 風景":
-        return "構図が良くて引き込まれます。"
-    elif category == "😊 人物":
-        return "自然な表情が魅力的です。"
-    else:
-        return "バランスの良い一枚です。"
+    # 食べ物（暖色）
+    if r > 120 and g > 80:
+        return "🍜 食べ物"
+
+    # 人物（明るくてコントラスト低め）
+    if color_var < 50 and r > 100:
+        return "😊 人物"
+
+    # ペット（色が強い）
+    if color_var > 70:
+        return "🐶 ペット"
+
+    return "📷 その他"
 
 # -------------------------
 # SNS画像生成
@@ -69,14 +70,7 @@ def create_sns_image(img, title):
     canvas.paste(base, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
-
-    # フォント（なければデフォルト）
-    try:
-        font = ImageFont.truetype("arial.ttf", 40)
-    except:
-        font = ImageFont.load_default()
-
-    draw.text((20, 620), title, fill="black", font=font)
+    draw.text((20, 620), title, fill="black")
 
     return canvas
 
@@ -96,18 +90,16 @@ if files:
 
     for i, file in enumerate(files):
         img = Image.open(file).convert("RGB")
-        img.thumbnail((800, 800))
+        img.thumbnail((800, 800))  # 軽量化
 
         score = calc_score(img)
-        category = detect_category(file.name)
-        comment = make_comment(category, score)
+        category = detect_category(img)
 
         results.append({
             "name": file.name,
             "img": img,
             "score": score,
-            "category": category,
-            "comment": comment
+            "category": category
         })
 
         progress.progress((i + 1) / len(files))
@@ -129,55 +121,57 @@ if files:
             st.subheader(f"{rank}位 {item['name']}")
             st.metric("スコア", item["score"])
             st.write(item["category"])
-            st.write(item["comment"])
 
         st.divider()
 
     # -------------------------
     # ジャンル別TOP3
     # -------------------------
-    st.header("🎯 ジャンル別ベスト3")
+    st.header("🎯 ジャンル別ランキング（TOP3）")
 
-    categories = list(set([x["category"] for x in results]))
+    categories = ["🐶 ペット", "🍜 食べ物", "🌄 風景", "😊 人物", "📷 その他"]
 
     for cat in categories:
+        cat_items = [x for x in results if x["category"] == cat]
+
+        if len(cat_items) == 0:
+            continue
+
         st.subheader(cat)
 
-        cat_items = [x for x in results if x["category"] == cat]
-        cat_items = sorted(cat_items, key=lambda x: x["score"], reverse=True)[:3]
+        top3 = sorted(cat_items, key=lambda x: x["score"], reverse=True)[:3]
 
-        cols = st.columns(3)
+        cols = st.columns(len(top3))
 
-        for i, item in enumerate(cat_items):
+        for i, item in enumerate(top3):
             with cols[i]:
                 st.image(item["img"], use_container_width=True)
                 st.write(f"{i+1}位")
                 st.write(f"スコア: {item['score']}")
 
-        # SNS画像生成
-        if len(cat_items) > 0:
-            sns_img = create_sns_image(cat_items[0]["img"], f"{cat} BEST1")
+        # SNS画像（1位）
+        best = top3[0]
+        sns_img = create_sns_image(best["img"], f"{cat} BEST1")
 
-            buf = io.BytesIO()
-            sns_img.save(buf, format="PNG")
+        buf = io.BytesIO()
+        sns_img.save(buf, format="PNG")
 
-            st.download_button(
-                f"{cat} SNS画像ダウンロード",
-                buf.getvalue(),
-                file_name=f"{cat}_best.png",
-                mime="image/png"
-            )
+        st.download_button(
+            f"{cat} SNS画像ダウンロード",
+            buf.getvalue(),
+            file_name=f"{cat}_best.png",
+            mime="image/png"
+        )
 
     # -------------------------
-    # CSV保存
+    # CSVダウンロード
     # -------------------------
     df = pd.DataFrame([
         {
             "順位": i+1,
             "名前": x["name"],
             "スコア": x["score"],
-            "カテゴリ": x["category"],
-            "コメント": x["comment"]
+            "カテゴリ": x["category"]
         }
         for i, x in enumerate(results)
     ])
